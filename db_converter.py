@@ -31,40 +31,22 @@ class PE(ABC):
     def get_pitch(x, fs, time_step=0.005, f0_min=40, f0_max=1100, voicing_threshold=0.45):
         raise NotImplementedError('Pitch Extractor not implemented')
 
-class ParselmouthPE(PE):
-    def get_pitch(x, fs, time_step=0.005, f0_min=40, f0_max=1100, voicing_threshold=0.45):
-        # from openvpi/DiffSinger/utils/binarizer_utils.py get_pitch_parselmouth
-        hop_size = time_step * fs
-        length = int(x.size / hop_size)
-
-        l_pad = int(np.ceil(1.5 / f0_min * fs))
-        r_pad = int(hop_size * ((x.size - 1) // hop_size + 1) - x.size + l_pad + 1)
-        x = np.pad(x, (l_pad, r_pad))
-
-        p = pm.Sound(x, sampling_frequency=fs).to_pitch_ac(
-            time_step=time_step, voicing_threshold=voicing_threshold,
-            pitch_floor=f0_min, pitch_ceiling=f0_max)
-        assert np.abs(p.t1 - 1.5 / f0_min) < 0.001
-
-        f0 = p.selected_array['frequency']
-        if f0.size < length:
-            f0 = np.pad(f0, (0, length - f0.size))
-        f0 = f0[:length]
-
-        return f0
     
 class HarvestPE(PE):
     def get_pitch(x, fs, time_step=0.005, f0_min=40, f0_max=1100, voicing_threshold=0.45):
         length = int(x.size / (time_step * fs))
         time_step *= 1000
+        sr=32000
 
         f0, _ = pw.harvest(x, fs, f0_floor=f0_min, f0_ceil=f0_max, frame_period=time_step)
-
+        sp = pw.cheaptrick(x, f0, _, sr)  # 스펙트럼 추출
+        ap = pw.d4c(x, f0, _, sr)
         if f0.size < length:
             f0 = np.pad(f0, (0, length - f0.size))
         f0 = f0[:length]
 
-        return f0
+
+        return f0, sp, ap
 
 # Simple label class cuz I'm quirky
 class Label:
@@ -542,27 +524,6 @@ def interp_f0(f0, uv=None):
     return denorm_f0(f0, uv=None), uv
 
 
-def write_ds(loc, wav, fs, pitch='parselmouth', time_step=0.005, f0_min=40, f0_max=1100, voicing_threshold=0.45, **kwargs):
-    res = {'offset' : 0}
-    res['text'] = kwargs['ph_seq']
-    res['ph_seq'] = kwargs['ph_seq']
-    res['ph_dur'] = kwargs['ph_dur']
-    if 'ph_num' in list(kwargs.keys()):
-        res['ph_num'] = kwargs['ph_num']
-        if 'note_seq' in list(kwargs.keys()):
-            res['note_seq'] = kwargs['note_seq']
-            res['note_dur'] = kwargs['note_dur']
-            res['note_slur'] = ' '.join(['0'] * len(kwargs['note_dur']))
-    f0 = pitch
-    if isinstance(pitch, str):
-        f0 = get_pitch(wav, fs, pe=pitch, time_step=time_step, f0_min=f0_min, f0_max=f0_max, voicing_threshold=voicing_threshold)
-    timestep = time_step
-    f0, _ = interp_f0(f0)
-    res['f0_seq'] = ' '.join([str(round(x, 1)) for x in f0])
-    res['f0_timestep'] = str(timestep)
-
-    with open(loc, 'w', encoding='utf8') as f:
-        json.dump([res], f, indent=4)
 
 def process_lab_wav_pair(segment_loc, lab, wav, args, lang=None):
     logging.info(f'Reading {wav}.')
@@ -571,18 +532,19 @@ def process_lab_wav_pair(segment_loc, lab, wav, args, lang=None):
     if x.ndim > 1:
         x = np.mean(x, axis=1)
 
-    if args.audio_sample_rate != 0 and fs != args.audio_sample_rate:
-        x = librosa.resample(x, orig_sr=fs, target_sr=args.audio_sample_rate)
-        fs = args.audio_sample_rate
+    audio_sample_rate = 32000
 
-    pitch = args.pitch_extractor # precalculate midi pitch
-    if args.estimate_midi or args.write_ds:
-        logging.info(f'Estimating pitch for {wav}')
-        pitch = get_pitch(x, fs, pe=pitch,
-                            time_step=args.time_step,
-                            f0_min=args.f0_min, f0_max=args.f0_max,
-                            voicing_threshold=args.voicing_threshold_midi)
-    
+    if audio_sample_rate != 0 and fs != audio_sample_rate:
+        logging.info(f'Resampling {wav} to {audio_sample_rate}')
+        x = librosa.resample(x, orig_sr=fs, target_sr=audio_sample_rate)
+        fs = audio_sample_rate
+
+    pitch = 'harvest'
+    logging.info(f'Estimating pitch for {wav}')
+    pitch, sp, ap = get_pitch(x, fs, pe='harvest',
+                        time_step=args.time_step,
+                        f0_min=args.f0_min, f0_max=args.f0_max,
+                        voicing_threshold=args.voicing_threshold_midi)
     logging.info(f'Segmenting {lab}.')
     fname = lab.stem
 
@@ -599,40 +561,34 @@ def process_lab_wav_pair(segment_loc, lab, wav, args, lang=None):
         p_s = int(segment.start / args.time_step)
         p_e = int(segment.end / args.time_step)
         segment_wav = x[s:e]
-        segment_pitch = pitch
-        if args.estimate_midi or args.write_ds:
-            segment_pitch = pitch[p_s:p_e]
+        segment_pitch = pitch[p_s:p_e]
+        segment_sp = sp[p_s:p_e]
+        segment_ap = ap[p_s:p_e]
 
-        if args.detect_breaths:
-            segment.detect_breath(segment_wav, fs,
-                                  time_step=args.time_step,
-                                  f0_min=args.f0_min, f0_max=args.f0_max,
-                                  voicing_threshold=args.voicing_threshold_breath,
-                                  window=args.breath_window_size,
-                                  min_len=args.breath_min_length,
-                                  min_db=args.breath_db_threshold,
-                                  min_centroid=args.breath_centroid_threshold)
 
         transcript_row = {
             'name' : segment_name,
             'ph_seq' : segment.to_phone_string(),
-            'ph_dur' : segment.to_lengths_string()
+            'ph_dur' : segment.to_lengths_string(),
+            'f0' : segment_pitch,
+            'sp' : segment_sp,
+            'ap' : segment_ap
             }
 
-        if args.language_def:
+        language_def = True
+        if language_def:
             transcript_row['ph_num'], split_pos = segment.to_phone_nums_string(lang=lang)
             dur = transcript_row['ph_dur'].split()
             num = [int(x) for x in transcript_row['ph_num'].split()]
             assert len(dur) == sum(num), 'Ops'
-            if args.estimate_midi:
-                note_seq, note_dur = segment.to_midi_strings(segment_wav, fs, split_pos,
+            note_seq, note_dur = segment.to_midi_strings(segment_wav, fs, split_pos,
                                                              pitch=segment_pitch,
                                                              time_step=args.time_step,
                                                              f0_min=args.f0_min, f0_max=args.f0_max,
                                                              voicing_threshold=args.voicing_threshold_midi,
                                                              cents=args.use_cents)
-                transcript_row['note_seq'] = note_seq
-                transcript_row['note_dur'] = note_dur
+            transcript_row['note_seq'] = note_seq
+            transcript_row['note_dur'] = note_dur
 
         all_pau = np.all(np.fromiter(map(lambda x : x in ['SP', 'AP'], transcript_row['ph_seq'].split()), bool))
         all_rest = False
@@ -646,10 +602,6 @@ def process_lab_wav_pair(segment_loc, lab, wav, args, lang=None):
                 isHTK = args.write_labels.lower() == 'htk'
                 write_label(segment_loc / (segment_name + ('.lab' if isHTK else '.txt')), segment, isHTK)
             
-            if args.write_ds:
-                write_ds(segment_loc / (segment_name + '.ds'), segment_wav, fs, pitch=segment_pitch,
-                         time_step=args.time_step, f0_min=args.f0_min, f0_max=args.f0_max,
-                         voicing_threshold=args.voicing_threshold_midi, **transcript_row)
         else:
             logging.warning('Detected pure silence either from segment label or note sequence. Skipping.')
     
@@ -659,7 +611,7 @@ if __name__ == '__main__':
     try:
         parser = ArgumentParser(description='Converts a database with mono labels (NNSVS Format) into the DiffSinger format and saves it in a new folder in the path supplemented.', formatter_class=CombinedFormatter)
         parser.add_argument('path', type=str, metavar='path', help='The path of the folder of the database.')
-        parser.add_argument('--num-processes', '-T', type=int, default=1, help='Number of processes to run for faster segmentation. Enter 0 to use all cores.')
+        parser.add_argument('--num-processes', '-T', type=int, default=10, help='Number of processes to run for faster segmentation. Enter 0 to use all cores.')
         parser.add_argument('--debug', '-d', action='store_true', help='Show debug logs.')
         segmenting_group = parser.add_argument_group(title='segmentation options', description='Options related to segmentation.')
         segmenting_group.add_argument('--max-length', '-l', type=float, default=15, help='The maximum length of the samples in seconds.')
@@ -691,7 +643,7 @@ if __name__ == '__main__':
             logging.getLogger().setLevel(logging.DEBUG)
         
         # Prepare locations
-        base_path = Path(args.path)
+        base_path = Path("/content/raw_data")
         diffsinger_loc = base_path / 'diffsinger_db'
         segment_loc = diffsinger_loc / 'wavs'
         transcript_loc = diffsinger_loc / 'transcriptions.csv'
@@ -716,20 +668,44 @@ if __name__ == '__main__':
             lab_wav[i] = temp[0]
 
         # check for language definition
-        lang = None
+        lang = {"vowels": [], "liquids": {"w": [], "y": "true"}}
         transcript_header = ['name', 'ph_seq', 'ph_dur']
-        if args.language_def:
-            with open(args.language_def) as f:
-                lang = json.load(f)
-            if isinstance(lang['liquids'], list): # support for old lang spec
-                lang['liquids'] = {x : True for x in lang['liquids']}
-            transcript_header.append('ph_num')
+        langdict = """{
+    "vowels" : ["a", "i", "u", "e", "o", "N", "A", "I", "U", "E", "O"],
+    "liquids" : {
+        "w" : ["k", "g"],
+        "y" : true
+    }
+}"""
 
-        if args.estimate_midi:
-            transcript_header.extend(['note_seq', 'note_dur'])
+        with open("/content/drive/MyDrive/DiiVerse/notations.json") as f:
+            nots = json.load(f)
+        
+        ptypes = set()
+
+        for key, val in nots.items():
+            ptypes.add(val)
+        
+
+        for _ in ptypes:
+            if _ != "vowel":
+                lang[_] = []
+        
+        for key, val in nots.items():
+            if val == "vowel":
+                lang["vowels"].append(key)
+            else:
+                lang[val].append(key)
+
+        if isinstance(lang['liquids'], list): # support for old lang spec
+            lang['liquids'] = {x : True for x in lang['liquids']}
+        transcript_header.append('ph_num')
+
+        transcript_header.extend(['note_seq', 'note_dur'])
 
         # actually make the directories
         logging.info('Making directories and files.')
+
         diffsinger_loc.mkdir(exist_ok=True)
         segment_loc.mkdir(exist_ok=True)
 
@@ -744,7 +720,7 @@ if __name__ == '__main__':
         if args.num_processes == 1:
             transcripts = []
             for lab, wav in lab_wav.items():
-                transcripts.extend(process_lab_wav_pair(segment_loc, lab, wav, args, lang))
+                transcripts.extend(process_lab_wav_pair(segment_loc, lab, wav, lang))
             logging.info('Writing all transcripts.')
             transcript.writerows(transcripts)
         else:
